@@ -2,6 +2,7 @@
 import os
 import requests
 from fastmcp import FastMCP
+from datetime import datetime
 
 # Initialize MCP server
 mcp = FastMCP("HubSpot MCP Server")
@@ -250,6 +251,148 @@ def search_owners(
         return {
             "error": "Owner search failed",
             "message": str(e),
+            "status": "error"
+        }
+
+@mcp.tool(description="Get notes associated with a HubSpot contact")
+def get_contact_notes(
+    contact_id: str,
+    include_timestamps: bool = True,
+    limit: int = 10,
+    search_text: str = None
+) -> dict:
+    """
+    Retrieve notes associated with a contact record.
+    
+    Args:
+        contact_id: Required HubSpot contact ID
+        include_timestamps: Include creation dates (default: True)
+        limit: Number of most recent notes to return (default: 10, max: 100)
+        search_text: Optional filter for notes containing specific text
+    
+    Returns:
+        Dictionary with array of note objects containing:
+        - note_text: The actual note content
+        - created_date: Timestamp when note was created (if include_timestamps=True)
+        - author: Name/ID of note creator
+        - note_type: Type of engagement
+        - associated_deals: List of associated deal IDs
+    """
+    if not HUBSPOT_ACCESS_TOKEN:
+        return {
+            "error": "HubSpot access token not configured",
+            "status": "error"
+        }
+    
+    try:
+        headers = {
+            "Authorization": f"Bearer {HUBSPOT_ACCESS_TOKEN}",
+            "Content-Type": "application/json"
+        }
+        
+        # First, verify the contact exists
+        contact_url = f"{HUBSPOT_API_BASE}/crm/v3/objects/contacts/{contact_id}"
+        contact_response = requests.get(contact_url, headers=headers)
+        if contact_response.status_code == 404:
+            return {
+                "error": f"Contact with ID {contact_id} does not exist",
+                "status": "error"
+            }
+        contact_response.raise_for_status()
+        
+        # Get note associations for this contact using v4 associations API
+        associations_url = f"{HUBSPOT_API_BASE}/crm/v4/objects/contacts/{contact_id}/associations/notes"
+        assoc_params = {"limit": min(limit, 500)}
+        
+        assoc_response = requests.get(associations_url, headers=headers, params=assoc_params)
+        assoc_response.raise_for_status()
+        
+        assoc_data = assoc_response.json()
+        note_associations = assoc_data.get("results", [])
+        
+        # If no notes found, return gracefully
+        if not note_associations:
+            return {
+                "status": "success",
+                "contact_id": contact_id,
+                "total_notes": 0,
+                "notes": [],
+                "message": "No notes found for this contact"
+            }
+        
+        # Get the actual note IDs
+        note_ids = [assoc.get("toObjectId") for assoc in note_associations]
+        
+        # Fetch the actual notes with their properties
+        processed_notes = []
+        
+        for note_id in note_ids[:limit]:  # Respect the limit
+            note_url = f"{HUBSPOT_API_BASE}/crm/v3/objects/notes/{note_id}"
+            note_params = {
+                "properties": "hs_note_body,hs_timestamp,hubspot_owner_id,hs_attachment_ids"
+            }
+            
+            try:
+                note_response = requests.get(note_url, headers=headers, params=note_params)
+                note_response.raise_for_status()
+                note_data = note_response.json()
+                
+                props = note_data.get("properties", {})
+                note_text = props.get("hs_note_body", "")
+                
+                # Apply search filter if provided
+                if search_text and search_text.lower() not in note_text.lower():
+                    continue
+                
+                note_obj = {
+                    "note_id": note_id,
+                    "note_text": note_text,
+                }
+                
+                if include_timestamps:
+                    timestamp = props.get("hs_timestamp")
+                    if timestamp:
+                        try:
+                            dt = datetime.fromtimestamp(int(timestamp) / 1000)
+                            note_obj["created_date"] = dt.isoformat()
+                        except:
+                            note_obj["created_date"] = timestamp
+                
+                owner_id = props.get("hubspot_owner_id")
+                if owner_id:
+                    note_obj["author_id"] = owner_id
+                
+                processed_notes.append(note_obj)
+                
+            except requests.exceptions.RequestException:
+                # Skip notes that fail to fetch
+                continue
+        
+        # Sort by timestamp if available
+        processed_notes.sort(
+            key=lambda x: x.get("created_date", ""),
+            reverse=True
+        )
+        
+        return {
+            "status": "success",
+            "contact_id": contact_id,
+            "total_notes": len(processed_notes),
+            "notes": processed_notes
+        }
+        
+    except requests.exceptions.RequestException as e:
+        error_message = str(e)
+        if hasattr(e, 'response') and e.response is not None:
+            try:
+                error_data = e.response.json()
+                error_message = error_data.get("message", error_message)
+            except:
+                pass
+        
+        return {
+            "error": "Failed to retrieve contact notes",
+            "message": error_message,
             "status": "error"
         }
 

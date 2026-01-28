@@ -117,9 +117,9 @@ def filter_deals(
     Filter HubSpot deals by specific properties.
     
     Args:
-        dealstage: Deal stage to filter by (e.g., "Proposal Sent", "appointmentscheduled")
-        pipeline: Pipeline name or ID to filter by (e.g., "Linq One", "default")
-        owner_id: Owner ID to filter by
+        dealstage: Deal stage to filter by (e.g., "54094855" for Proposal Sent)
+        pipeline: Pipeline ID to filter by (e.g., "54094853" for Linq One)
+        owner_id: Owner ID to filter by (e.g., "1944725253")
         limit: Maximum number of results to return (default: 100, max: 100)
     
     Returns:
@@ -325,9 +325,9 @@ if __name__ == "__main__":
     
     print(f"Starting HubSpot FastMCP server on {host}:{port}")
     
+    # Run with SSE transport for MCP integration compatibility
     mcp.run(
-        transport="http",
+        transport="sse",
         host=host,
-        port=port,
-        stateless_http=True
+        port=port
     )

@@ -31,7 +31,7 @@ def search_hubspot(
     limit: int = 10
 ) -> dict:
     """
-    Search HubSpot CRM objects.
+    Search HubSpot CRM objects by text query.
     
     Args:
         query: Search term to find in records
@@ -60,7 +60,7 @@ def search_hubspot(
         properties = {
             "contacts": ["firstname", "lastname", "email", "phone", "company"],
             "companies": ["name", "domain", "industry", "city"],
-            "deals": ["dealname", "amount", "dealstage", "closedate", "pipeline"],
+            "deals": ["dealname", "amount", "dealstage", "closedate", "pipeline", "hubspot_owner_id"],
             "tickets": ["subject", "content", "hs_pipeline_stage"]
         }.get(object_type, ["name"])
         
@@ -102,6 +102,153 @@ def search_hubspot(
     except requests.exceptions.RequestException as e:
         return {
             "error": "Search failed",
+            "message": str(e),
+            "status": "error"
+        }
+
+@mcp.tool(description="Filter HubSpot deals by stage, pipeline, owner, or other properties")
+def filter_deals(
+    dealstage: str = None,
+    pipeline: str = None,
+    owner_id: str = None,
+    limit: int = 100
+) -> dict:
+    """
+    Filter HubSpot deals by specific properties.
+    
+    Args:
+        dealstage: Deal stage to filter by (e.g., "Proposal Sent", "appointmentscheduled")
+        pipeline: Pipeline name or ID to filter by (e.g., "Linq One", "default")
+        owner_id: Owner ID to filter by
+        limit: Maximum number of results to return (default: 100, max: 100)
+    
+    Returns:
+        Dictionary with filtered deals
+    """
+    if not HUBSPOT_ACCESS_TOKEN:
+        return {
+            "error": "HubSpot access token not configured",
+            "status": "error"
+        }
+    
+    try:
+        # Build filters
+        filters = []
+        
+        if dealstage:
+            filters.append({
+                "propertyName": "dealstage",
+                "operator": "EQ",
+                "value": dealstage
+            })
+        
+        if pipeline:
+            filters.append({
+                "propertyName": "pipeline",
+                "operator": "EQ",
+                "value": pipeline
+            })
+        
+        if owner_id:
+            filters.append({
+                "propertyName": "hubspot_owner_id",
+                "operator": "EQ",
+                "value": owner_id
+            })
+        
+        if not filters:
+            return {
+                "error": "At least one filter parameter is required (dealstage, pipeline, or owner_id)",
+                "status": "error"
+            }
+        
+        # Build search request
+        url = f"{HUBSPOT_API_BASE}/crm/v3/objects/deals/search"
+        headers = {
+            "Authorization": f"Bearer {HUBSPOT_ACCESS_TOKEN}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "filterGroups": [
+                {
+                    "filters": filters
+                }
+            ],
+            "properties": ["dealname", "amount", "dealstage", "closedate", "pipeline", "hubspot_owner_id", "createdate"],
+            "limit": min(limit, 100)
+        }
+        
+        response = requests.post(url, json=payload, headers=headers)
+        response.raise_for_status()
+        
+        data = response.json()
+        
+        return {
+            "status": "success",
+            "filters_applied": {
+                "dealstage": dealstage,
+                "pipeline": pipeline,
+                "owner_id": owner_id
+            },
+            "total": data.get("total", 0),
+            "results": data.get("results", [])
+        }
+        
+    except requests.exceptions.RequestException as e:
+        return {
+            "error": "Filter failed",
+            "message": str(e),
+            "status": "error"
+        }
+
+@mcp.tool(description="Get HubSpot owner information by searching for owners")
+def search_owners(
+    search_query: str = None,
+    limit: int = 25
+) -> dict:
+    """
+    Search for HubSpot owners (users who can own deals/contacts).
+    
+    Args:
+        search_query: Optional search term to filter owners by name or email
+        limit: Maximum number of results (default: 25, max: 100)
+    
+    Returns:
+        Dictionary with owner information including IDs
+    """
+    if not HUBSPOT_ACCESS_TOKEN:
+        return {
+            "error": "HubSpot access token not configured",
+            "status": "error"
+        }
+    
+    try:
+        url = f"{HUBSPOT_API_BASE}/crm/v3/owners/"
+        headers = {
+            "Authorization": f"Bearer {HUBSPOT_ACCESS_TOKEN}",
+            "Content-Type": "application/json"
+        }
+        params = {
+            "limit": min(limit, 100)
+        }
+        
+        if search_query:
+            params["email"] = search_query
+        
+        response = requests.get(url, headers=headers, params=params)
+        response.raise_for_status()
+        
+        data = response.json()
+        
+        return {
+            "status": "success",
+            "total": len(data.get("results", [])),
+            "results": data.get("results", [])
+        }
+        
+    except requests.exceptions.RequestException as e:
+        return {
+            "error": "Owner search failed",
             "message": str(e),
             "status": "error"
         }

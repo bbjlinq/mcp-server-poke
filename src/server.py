@@ -4,473 +4,595 @@ import requests
 from fastmcp import FastMCP
 from datetime import datetime
 
-# Initialize MCP server
+# Initialize MCP server with SSE transport for Poke compatibility
 mcp = FastMCP("HubSpot MCP Server")
 
 # Get HubSpot access token from environment
 HUBSPOT_ACCESS_TOKEN = os.environ.get("HUBSPOT_ACCESS_TOKEN")
 HUBSPOT_API_BASE = "https://api.hubapi.com"
 
-@mcp.tool(description="Greet a user by name with a welcome message from the MCP server")
-def greet(name: str) -> str:
-    return f"Hello, {name}! Welcome to our HubSpot MCP server!"
-
-@mcp.tool(description="Get information about the MCP server including name, version, environment, and Python version")
-def get_server_info() -> dict:
+def get_headers():
+    """Get authorization headers for HubSpot API calls."""
     return {
-        "server_name": "HubSpot MCP Server",
-        "version": "1.0.0",
-        "environment": os.environ.get("ENVIRONMENT", "development"),
-        "python_version": os.sys.version.split()[0],
-        "hubspot_connected": bool(HUBSPOT_ACCESS_TOKEN)
+        "Authorization": f"Bearer {HUBSPOT_ACCESS_TOKEN}",
+        "Content-Type": "application/json"
     }
 
-@mcp.tool(description="Search HubSpot CRM for contacts, deals, companies, or other objects")
-def search_hubspot(
-    query: str,
-    object_type: str = "contacts",
-    limit: int = 10
-) -> dict:
+
+# =============================================================================
+# DEPLOY 1: Pipeline & Stage Mapping
+# =============================================================================
+
+@mcp.tool()
+def get_pipelines() -> dict:
     """
-    Search HubSpot CRM objects by text query.
+    Get all deal pipelines and stages with human-readable names.
+    Returns mapping of numeric IDs to display names for both pipelines and deal stages.
+    Use this to convert IDs like '241882253' to names like 'Purchase Order Sent'.
+    """
+    try:
+        result = {
+            "pipelines": {},
+            "stages": {}
+        }
+        
+        # Get pipeline property (contains all pipeline options)
+        url = f"{HUBSPOT_API_BASE}/crm/v3/properties/deals/pipeline"
+        response = requests.get(url, headers=get_headers())
+        if response.status_code == 200:
+            data = response.json()
+            for option in data.get("options", []):
+                result["pipelines"][option["value"]] = option["label"]
+        
+        # Get dealstage property (contains all stage options)
+        url = f"{HUBSPOT_API_BASE}/crm/v3/properties/deals/dealstage"
+        response = requests.get(url, headers=get_headers())
+        if response.status_code == 200:
+            data = response.json()
+            for option in data.get("options", []):
+                result["stages"][option["value"]] = option["label"]
+        
+        return result
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# =============================================================================
+# DEPLOY 2: Deal Associations (Contacts, Companies, Line Items)
+# =============================================================================
+
+@mcp.tool()
+def get_deal_contacts(deal_id: str) -> dict:
+    """
+    Get all contacts associated with a specific deal.
+    Returns contact details including name, email, phone, and job title.
     
     Args:
-        query: Search term to find in records
-        object_type: Type of object to search (contacts, deals, companies, tickets)
-        limit: Maximum number of results to return (default: 10, max: 100)
-    
-    Returns:
-        Dictionary with search results including total count and matching records
+        deal_id: The HubSpot deal ID (e.g., '54956811307')
     """
-    if not HUBSPOT_ACCESS_TOKEN:
-        return {
-            "error": "HubSpot access token not configured",
-            "status": "error"
-        }
-    
     try:
-        # Determine which property to search based on object type
-        search_property = {
-            "contacts": "email",
-            "companies": "name",
-            "deals": "dealname",
-            "tickets": "subject"
-        }.get(object_type, "name")
+        # First get associated contact IDs using v4 associations API
+        url = f"{HUBSPOT_API_BASE}/crm/v4/objects/deals/{deal_id}/associations/contacts"
+        response = requests.get(url, headers=get_headers())
         
-        # Determine which properties to return
-        properties = {
-            "contacts": ["firstname", "lastname", "email", "phone", "company"],
-            "companies": ["name", "domain", "industry", "city"],
-            "deals": ["dealname", "amount", "dealstage", "closedate", "pipeline", "hubspot_owner_id"],
-            "tickets": ["subject", "content", "hs_pipeline_stage"]
-        }.get(object_type, ["name"])
+        if response.status_code != 200:
+            return {"error": f"Failed to get associations: {response.text}"}
         
-        # Build search request
-        url = f"{HUBSPOT_API_BASE}/crm/v3/objects/{object_type}/search"
-        headers = {
-            "Authorization": f"Bearer {HUBSPOT_ACCESS_TOKEN}",
-            "Content-Type": "application/json"
+        associations = response.json().get("results", [])
+        if not associations:
+            return {"contacts": [], "message": "No contacts associated with this deal"}
+        
+        # Get contact details for each associated contact
+        contacts = []
+        for assoc in associations:
+            contact_id = assoc.get("toObjectId")
+            if contact_id:
+                contact_url = f"{HUBSPOT_API_BASE}/crm/v3/objects/contacts/{contact_id}"
+                params = {"properties": "firstname,lastname,email,phone,jobtitle,company"}
+                contact_response = requests.get(contact_url, headers=get_headers(), params=params)
+                if contact_response.status_code == 200:
+                    contact_data = contact_response.json()
+                    contacts.append({
+                        "id": contact_id,
+                        "properties": contact_data.get("properties", {})
+                    })
+        
+        return {"contacts": contacts, "count": len(contacts)}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def get_deal_companies(deal_id: str) -> dict:
+    """
+    Get all companies associated with a specific deal.
+    Returns company details including name, domain, industry, and employee count.
+    
+    Args:
+        deal_id: The HubSpot deal ID (e.g., '54956811307')
+    """
+    try:
+        # Get associated company IDs using v4 associations API
+        url = f"{HUBSPOT_API_BASE}/crm/v4/objects/deals/{deal_id}/associations/companies"
+        response = requests.get(url, headers=get_headers())
+        
+        if response.status_code != 200:
+            return {"error": f"Failed to get associations: {response.text}"}
+        
+        associations = response.json().get("results", [])
+        if not associations:
+            return {"companies": [], "message": "No companies associated with this deal"}
+        
+        # Get company details for each associated company
+        companies = []
+        for assoc in associations:
+            company_id = assoc.get("toObjectId")
+            if company_id:
+                company_url = f"{HUBSPOT_API_BASE}/crm/v3/objects/companies/{company_id}"
+                params = {"properties": "name,domain,industry,numberofemployees,city,state,country"}
+                company_response = requests.get(company_url, headers=get_headers(), params=params)
+                if company_response.status_code == 200:
+                    company_data = company_response.json()
+                    companies.append({
+                        "id": company_id,
+                        "properties": company_data.get("properties", {})
+                    })
+        
+        return {"companies": companies, "count": len(companies)}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def get_deal_line_items(deal_id: str) -> dict:
+    """
+    Get all line items (products) associated with a specific deal.
+    Returns product details including name, quantity, price, and amount.
+    Use this to see what's included in a deal's total amount.
+    
+    Args:
+        deal_id: The HubSpot deal ID (e.g., '54956811307')
+    """
+    try:
+        # Get associated line item IDs using v4 associations API
+        url = f"{HUBSPOT_API_BASE}/crm/v4/objects/deals/{deal_id}/associations/line_items"
+        response = requests.get(url, headers=get_headers())
+        
+        if response.status_code != 200:
+            return {"error": f"Failed to get associations: {response.text}"}
+        
+        associations = response.json().get("results", [])
+        if not associations:
+            return {"line_items": [], "message": "No line items associated with this deal"}
+        
+        # Get line item details for each associated item
+        line_items = []
+        total_amount = 0
+        for assoc in associations:
+            item_id = assoc.get("toObjectId")
+            if item_id:
+                item_url = f"{HUBSPOT_API_BASE}/crm/v3/objects/line_items/{item_id}"
+                params = {"properties": "name,quantity,price,amount,hs_product_id,description,hs_recurring_billing_period"}
+                item_response = requests.get(item_url, headers=get_headers(), params=params)
+                if item_response.status_code == 200:
+                    item_data = item_response.json()
+                    props = item_data.get("properties", {})
+                    line_items.append({
+                        "id": item_id,
+                        "properties": props
+                    })
+                    if props.get("amount"):
+                        total_amount += float(props["amount"])
+        
+        return {
+            "line_items": line_items, 
+            "count": len(line_items),
+            "total_amount": total_amount
         }
-        payload = {
-            "filterGroups": [
-                {
-                    "filters": [
-                        {
-                            "propertyName": search_property,
-                            "operator": "CONTAINS_TOKEN",
-                            "value": query
-                        }
-                    ]
-                }
-            ],
-            "properties": properties,
-            "limit": min(limit, 100)
-        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# =============================================================================
+# DEPLOY 3: History & Activity (Notes, Stage History, Emails)
+# =============================================================================
+
+@mcp.tool()
+def get_deal_notes(deal_id: str) -> dict:
+    """
+    Get all notes associated with a specific deal.
+    Returns note content, timestamp, and owner information.
+    Use this to see the activity history and context on deal progression.
+    
+    Args:
+        deal_id: The HubSpot deal ID (e.g., '54956811307')
+    """
+    try:
+        # Get associated note IDs using v4 associations API
+        url = f"{HUBSPOT_API_BASE}/crm/v4/objects/deals/{deal_id}/associations/notes"
+        response = requests.get(url, headers=get_headers())
         
-        response = requests.post(url, json=payload, headers=headers)
-        response.raise_for_status()
+        if response.status_code != 200:
+            return {"error": f"Failed to get associations: {response.text}"}
+        
+        associations = response.json().get("results", [])
+        if not associations:
+            return {"notes": [], "message": "No notes associated with this deal"}
+        
+        # Get note details for each associated note
+        notes = []
+        for assoc in associations:
+            note_id = assoc.get("toObjectId")
+            if note_id:
+                note_url = f"{HUBSPOT_API_BASE}/crm/v3/objects/notes/{note_id}"
+                params = {"properties": "hs_note_body,hs_timestamp,hubspot_owner_id,hs_attachment_ids"}
+                note_response = requests.get(note_url, headers=get_headers(), params=params)
+                if note_response.status_code == 200:
+                    note_data = note_response.json()
+                    notes.append({
+                        "id": note_id,
+                        "properties": note_data.get("properties", {})
+                    })
+        
+        # Sort by timestamp descending (most recent first)
+        notes.sort(key=lambda x: x.get("properties", {}).get("hs_timestamp", ""), reverse=True)
+        
+        return {"notes": notes, "count": len(notes)}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def get_deal_stage_history(deal_id: str) -> dict:
+    """
+    Get the stage history for a specific deal showing when it moved between stages.
+    Returns timeline of stage changes with timestamps.
+    
+    Args:
+        deal_id: The HubSpot deal ID (e.g., '54956811307')
+    """
+    try:
+        # Use propertiesWithHistory to get stage change history
+        url = f"{HUBSPOT_API_BASE}/crm/v3/objects/deals/{deal_id}"
+        params = {
+            "properties": "dealname,dealstage,pipeline",
+            "propertiesWithHistory": "dealstage"
+        }
+        response = requests.get(url, headers=get_headers(), params=params)
+        
+        if response.status_code != 200:
+            return {"error": f"Failed to get deal: {response.text}"}
         
         data = response.json()
+        properties = data.get("properties", {})
+        properties_with_history = data.get("propertiesWithHistory", {})
+        
+        stage_history = []
+        if "dealstage" in properties_with_history:
+            for entry in properties_with_history["dealstage"]:
+                stage_history.append({
+                    "stage_id": entry.get("value"),
+                    "timestamp": entry.get("timestamp"),
+                    "source": entry.get("sourceType")
+                })
+        
+        # Sort by timestamp ascending (oldest first) to show progression
+        stage_history.sort(key=lambda x: x.get("timestamp", ""))
         
         return {
-            "status": "success",
-            "object_type": object_type,
-            "query": query,
-            "total": data.get("total", 0),
-            "results": data.get("results", [])
+            "deal_id": deal_id,
+            "deal_name": properties.get("dealname"),
+            "current_stage": properties.get("dealstage"),
+            "pipeline": properties.get("pipeline"),
+            "stage_history": stage_history,
+            "total_stage_changes": len(stage_history)
         }
-        
-    except requests.exceptions.RequestException as e:
-        return {
-            "error": "Search failed",
-            "message": str(e),
-            "status": "error"
-        }
+    except Exception as e:
+        return {"error": str(e)}
 
-@mcp.tool(description="Filter HubSpot deals by stage, pipeline, owner, or other properties")
-def filter_deals(
-    dealstage: str = None,
-    pipeline: str = None,
-    owner_id: str = None,
-    limit: int = 100
-) -> dict:
+
+@mcp.tool()
+def get_deal_emails(deal_id: str) -> dict:
     """
-    Filter HubSpot deals by specific properties.
+    Get all emails associated with a specific deal.
+    Returns email subject, body preview, sender, recipients, and timestamp.
+    Use this to see communication history linked to a deal.
     
     Args:
-        dealstage: Deal stage to filter by (e.g., "54094855" for Proposal Sent)
-        pipeline: Pipeline ID to filter by (e.g., "54094853" for Linq One)
-        owner_id: Owner ID to filter by (e.g., "1944725253")
-        limit: Maximum number of results to return (default: 100, max: 100)
-    
-    Returns:
-        Dictionary with filtered deals
+        deal_id: The HubSpot deal ID (e.g., '54956811307')
     """
-    if not HUBSPOT_ACCESS_TOKEN:
-        return {
-            "error": "HubSpot access token not configured",
-            "status": "error"
-        }
-    
     try:
-        # Build filters
+        # Get associated email IDs using v4 associations API
+        url = f"{HUBSPOT_API_BASE}/crm/v4/objects/deals/{deal_id}/associations/emails"
+        response = requests.get(url, headers=get_headers())
+        
+        if response.status_code != 200:
+            return {"error": f"Failed to get associations: {response.text}"}
+        
+        associations = response.json().get("results", [])
+        if not associations:
+            return {"emails": [], "message": "No emails associated with this deal"}
+        
+        # Get email details for each associated email
+        emails = []
+        for assoc in associations:
+            email_id = assoc.get("toObjectId")
+            if email_id:
+                email_url = f"{HUBSPOT_API_BASE}/crm/v3/objects/emails/{email_id}"
+                params = {"properties": "hs_email_subject,hs_email_text,hs_email_direction,hs_timestamp,hs_email_sender_email,hs_email_to_email"}
+                email_response = requests.get(email_url, headers=get_headers(), params=params)
+                if email_response.status_code == 200:
+                    email_data = email_response.json()
+                    emails.append({
+                        "id": email_id,
+                        "properties": email_data.get("properties", {})
+                    })
+        
+        # Sort by timestamp descending (most recent first)
+        emails.sort(key=lambda x: x.get("properties", {}).get("hs_timestamp", ""), reverse=True)
+        
+        return {"emails": emails, "count": len(emails)}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# =============================================================================
+# EXISTING FUNCTIONS (with fixes applied)
+# =============================================================================
+
+@mcp.tool()
+def search_hubspot(query: str, object_type: str = "contacts") -> dict:
+    """
+    Search HubSpot for contacts, companies, or deals by name/email.
+    
+    Args:
+        query: Search term (name, email, company name, deal name)
+        object_type: Type of object to search - 'contacts', 'companies', or 'deals'
+    """
+    try:
+        url = f"{HUBSPOT_API_BASE}/crm/v3/objects/{object_type}/search"
+        payload = {
+            "query": query,
+            "limit": 10,
+            "properties": ["firstname", "lastname", "email", "phone", "company"] if object_type == "contacts"
+                else ["name", "domain", "industry"] if object_type == "companies"
+                else ["dealname", "amount", "dealstage", "pipeline", "closedate"]
+        }
+        response = requests.post(url, headers=get_headers(), json=payload)
+        return response.json()
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def filter_deals(
+    pipeline: str = None,
+    dealstage: str = None,
+    hubspot_owner_id: str = None,
+    min_amount: float = None,
+    max_amount: float = None,
+    limit: int = 50
+) -> dict:
+    """
+    Filter deals by pipeline, stage, owner, and/or amount range.
+    All parameters are optional - only provided filters will be applied.
+    
+    IMPORTANT: Use numeric IDs for pipeline, dealstage, and hubspot_owner_id.
+    Call get_pipelines() first to get the ID-to-name mappings.
+    Call search_owners() to get owner IDs.
+    
+    Args:
+        pipeline: Pipeline ID (e.g., '141575188' for 'Linq One')
+        dealstage: Deal stage ID (e.g., '241882253' for 'Purchase Order Sent')
+        hubspot_owner_id: Owner ID (e.g., '76301235' for 'Benjamin Johnson')
+        min_amount: Minimum deal amount
+        max_amount: Maximum deal amount
+        limit: Maximum number of results (default 50)
+    """
+    try:
+        url = f"{HUBSPOT_API_BASE}/crm/v3/objects/deals/search"
+        
+        # Build filters only for provided parameters
         filters = []
         
-        if dealstage:
-            filters.append({
-                "propertyName": "dealstage",
-                "operator": "EQ",
-                "value": dealstage
-            })
-        
-        if pipeline:
+        if pipeline is not None and str(pipeline).strip():
             filters.append({
                 "propertyName": "pipeline",
                 "operator": "EQ",
-                "value": pipeline
+                "value": str(pipeline)
             })
         
-        if owner_id:
+        if dealstage is not None and str(dealstage).strip():
+            filters.append({
+                "propertyName": "dealstage",
+                "operator": "EQ",
+                "value": str(dealstage)
+            })
+        
+        if hubspot_owner_id is not None and str(hubspot_owner_id).strip():
             filters.append({
                 "propertyName": "hubspot_owner_id",
                 "operator": "EQ",
-                "value": owner_id
+                "value": str(hubspot_owner_id)
             })
         
-        if not filters:
-            return {
-                "error": "At least one filter parameter is required (dealstage, pipeline, or owner_id)",
-                "status": "error"
-            }
+        if min_amount is not None:
+            filters.append({
+                "propertyName": "amount",
+                "operator": "GTE",
+                "value": str(min_amount)
+            })
         
-        # Build search request
-        url = f"{HUBSPOT_API_BASE}/crm/v3/objects/deals/search"
-        headers = {
-            "Authorization": f"Bearer {HUBSPOT_ACCESS_TOKEN}",
-            "Content-Type": "application/json"
-        }
+        if max_amount is not None:
+            filters.append({
+                "propertyName": "amount",
+                "operator": "LTE",
+                "value": str(max_amount)
+            })
+        
         payload = {
-            "filterGroups": [
-                {
-                    "filters": filters
-                }
-            ],
-            "properties": ["dealname", "amount", "dealstage", "closedate", "pipeline", "hubspot_owner_id", "createdate"],
-            "limit": min(limit, 100)
+            "limit": limit,
+            "properties": ["dealname", "amount", "dealstage", "pipeline", "closedate", "hubspot_owner_id"]
         }
         
-        response = requests.post(url, json=payload, headers=headers)
-        response.raise_for_status()
+        # Only add filterGroups if we have filters
+        if filters:
+            payload["filterGroups"] = [{"filters": filters}]
         
-        data = response.json()
+        response = requests.post(url, headers=get_headers(), json=payload)
+        result = response.json()
         
-        return {
-            "status": "success",
-            "filters_applied": {
-                "dealstage": dealstage,
-                "pipeline": pipeline,
-                "owner_id": owner_id
-            },
-            "total": data.get("total", 0),
-            "results": data.get("results", [])
-        }
+        # Add total count for clarity
+        if "total" in result:
+            result["message"] = f"Found {result['total']} deals matching filters"
         
-    except requests.exceptions.RequestException as e:
-        return {
-            "error": "Filter failed",
-            "message": str(e),
-            "status": "error"
-        }
+        return result
+    except Exception as e:
+        return {"error": str(e)}
 
-@mcp.tool(description="Get HubSpot owner information by searching for owners")
-def search_owners(
-    search_query: str = None,
-    limit: int = 25
-) -> dict:
+
+@mcp.tool()
+def search_owners(query: str = None) -> dict:
     """
-    Search for HubSpot owners (users who can own deals/contacts).
+    Search for HubSpot owners (users who can be assigned to records).
+    Returns owner IDs needed for filtering deals by owner.
     
     Args:
-        search_query: Optional search term to filter owners by name or email
-        limit: Maximum number of results (default: 25, max: 100)
-    
-    Returns:
-        Dictionary with owner information including IDs
+        query: Optional search term to filter owners by name or email.
+               If not provided, returns all owners.
     """
-    if not HUBSPOT_ACCESS_TOKEN:
-        return {
-            "error": "HubSpot access token not configured",
-            "status": "error"
-        }
-    
     try:
-        url = f"{HUBSPOT_API_BASE}/crm/v3/owners/"
-        headers = {
-            "Authorization": f"Bearer {HUBSPOT_ACCESS_TOKEN}",
-            "Content-Type": "application/json"
-        }
-        params = {
-            "limit": min(limit, 100)
-        }
+        url = f"{HUBSPOT_API_BASE}/crm/v3/owners"
+        params = {"limit": 100}
+        if query:
+            params["email"] = query
         
-        if search_query:
-            params["email"] = search_query
-        
-        response = requests.get(url, headers=headers, params=params)
-        response.raise_for_status()
-        
+        response = requests.get(url, headers=get_headers(), params=params)
         data = response.json()
         
-        return {
-            "status": "success",
-            "total": len(data.get("results", [])),
-            "results": data.get("results", [])
-        }
-        
-    except requests.exceptions.RequestException as e:
-        return {
-            "error": "Owner search failed",
-            "message": str(e),
-            "status": "error"
-        }
-
-@mcp.tool(description="Get notes associated with a HubSpot contact")
-def get_contact_notes(
-    contact_id: str,
-    include_timestamps: bool = True,
-    limit: int = 10,
-    search_text: str = None
-) -> dict:
-    """
-    Retrieve notes associated with a contact record.
-    
-    Args:
-        contact_id: Required HubSpot contact ID
-        include_timestamps: Include creation dates (default: True)
-        limit: Number of most recent notes to return (default: 10, max: 100)
-        search_text: Optional filter for notes containing specific text
-    
-    Returns:
-        Dictionary with array of note objects containing:
-        - note_text: The actual note content
-        - created_date: Timestamp when note was created (if include_timestamps=True)
-        - author: Name/ID of note creator
-        - note_type: Type of engagement
-        - associated_deals: List of associated deal IDs
-    """
-    if not HUBSPOT_ACCESS_TOKEN:
-        return {
-            "error": "HubSpot access token not configured",
-            "status": "error"
-        }
-    
-    try:
-        headers = {
-            "Authorization": f"Bearer {HUBSPOT_ACCESS_TOKEN}",
-            "Content-Type": "application/json"
-        }
-        
-        # First, verify the contact exists
-        contact_url = f"{HUBSPOT_API_BASE}/crm/v3/objects/contacts/{contact_id}"
-        contact_response = requests.get(contact_url, headers=headers)
-        if contact_response.status_code == 404:
-            return {
-                "error": f"Contact with ID {contact_id} does not exist",
-                "status": "error"
-            }
-        contact_response.raise_for_status()
-        
-        # Get note associations for this contact using v4 associations API
-        associations_url = f"{HUBSPOT_API_BASE}/crm/v4/objects/contacts/{contact_id}/associations/notes"
-        assoc_params = {"limit": min(limit, 500)}
-        
-        assoc_response = requests.get(associations_url, headers=headers, params=assoc_params)
-        assoc_response.raise_for_status()
-        
-        assoc_data = assoc_response.json()
-        note_associations = assoc_data.get("results", [])
-        
-        # If no notes found, return gracefully
-        if not note_associations:
-            return {
-                "status": "success",
-                "contact_id": contact_id,
-                "total_notes": 0,
-                "notes": [],
-                "message": "No notes found for this contact"
-            }
-        
-        # Get the actual note IDs
-        note_ids = [assoc.get("toObjectId") for assoc in note_associations]
-        
-        # Fetch the actual notes with their properties
-        processed_notes = []
-        
-        for note_id in note_ids[:limit]:  # Respect the limit
-            note_url = f"{HUBSPOT_API_BASE}/crm/v3/objects/notes/{note_id}"
-            note_params = {
-                "properties": "hs_note_body,hs_timestamp,hubspot_owner_id,hs_attachment_ids"
-            }
-            
-            try:
-                note_response = requests.get(note_url, headers=headers, params=note_params)
-                note_response.raise_for_status()
-                note_data = note_response.json()
-                
-                props = note_data.get("properties", {})
-                note_text = props.get("hs_note_body", "")
-                
-                # Apply search filter if provided
-                if search_text and search_text.lower() not in note_text.lower():
+        owners = []
+        for owner in data.get("results", []):
+            owner_name = f"{owner.get('firstName', '')} {owner.get('lastName', '')}".strip()
+            # Filter by query if provided (case-insensitive search in name or email)
+            if query:
+                query_lower = query.lower()
+                if query_lower not in owner_name.lower() and query_lower not in owner.get("email", "").lower():
                     continue
-                
-                note_obj = {
-                    "note_id": note_id,
-                    "note_text": note_text,
-                }
-                
-                if include_timestamps:
-                    timestamp = props.get("hs_timestamp")
-                    if timestamp:
-                        try:
-                            dt = datetime.fromtimestamp(int(timestamp) / 1000)
-                            note_obj["created_date"] = dt.isoformat()
-                        except:
-                            note_obj["created_date"] = timestamp
-                
-                owner_id = props.get("hubspot_owner_id")
-                if owner_id:
-                    note_obj["author_id"] = owner_id
-                
-                processed_notes.append(note_obj)
-                
-            except requests.exceptions.RequestException:
-                # Skip notes that fail to fetch
-                continue
+            
+            owners.append({
+                "id": owner.get("id"),
+                "name": owner_name,
+                "email": owner.get("email"),
+                "active": not owner.get("archived", False)
+            })
         
-        # Sort by timestamp if available
-        processed_notes.sort(
-            key=lambda x: x.get("created_date", ""),
-            reverse=True
-        )
-        
-        return {
-            "status": "success",
-            "contact_id": contact_id,
-            "total_notes": len(processed_notes),
-            "notes": processed_notes
-        }
-        
-    except requests.exceptions.RequestException as e:
-        error_message = str(e)
-        if hasattr(e, 'response') and e.response is not None:
-            try:
-                error_data = e.response.json()
-                error_message = error_data.get("message", error_message)
-            except:
-                pass
-        
-        return {
-            "error": "Failed to retrieve contact notes",
-            "message": error_message,
-            "status": "error"
-        }
+        return {"owners": owners, "count": len(owners)}
+    except Exception as e:
+        return {"error": str(e)}
 
-@mcp.tool(description="Update, create, or get HubSpot CRM records")
-def update_hubspot(
-    action: str,
-    object_type: str,
-    object_id: str = None,
-    properties: dict = None
-) -> dict:
+
+@mcp.tool()
+def get_contact_notes(contact_id: str) -> dict:
     """
-    Perform actions on HubSpot CRM records.
+    Get all notes associated with a specific contact.
+    Uses the v4 associations API to find linked notes.
     
     Args:
-        action: Action to perform (update, create, get)
-        object_type: Type of object (contacts, deals, companies, tickets)
-        object_id: ID of the object (required for update and get)
-        properties: Dictionary of properties to update/create
-    
-    Returns:
-        Dictionary with action result
+        contact_id: The HubSpot contact ID
     """
-    if not HUBSPOT_ACCESS_TOKEN:
-        return {
-            "error": "HubSpot access token not configured",
-            "status": "error"
-        }
-    
     try:
-        headers = {
-            "Authorization": f"Bearer {HUBSPOT_ACCESS_TOKEN}",
-            "Content-Type": "application/json"
-        }
+        # Get associated note IDs using v4 associations API
+        url = f"{HUBSPOT_API_BASE}/crm/v4/objects/contacts/{contact_id}/associations/notes"
+        response = requests.get(url, headers=get_headers())
         
-        if action == "update":
-            if not object_id:
-                return {"error": "object_id required for update", "status": "error"}
-            url = f"{HUBSPOT_API_BASE}/crm/v3/objects/{object_type}/{object_id}"
-            response = requests.patch(url, json={"properties": properties}, headers=headers)
-            
-        elif action == "create":
-            url = f"{HUBSPOT_API_BASE}/crm/v3/objects/{object_type}"
-            response = requests.post(url, json={"properties": properties}, headers=headers)
-            
-        elif action == "get":
-            if not object_id:
-                return {"error": "object_id required for get", "status": "error"}
-            url = f"{HUBSPOT_API_BASE}/crm/v3/objects/{object_type}/{object_id}"
-            response = requests.get(url, headers=headers)
-            
+        if response.status_code != 200:
+            return {"error": f"Failed to get associations: {response.text}"}
+        
+        associations = response.json().get("results", [])
+        if not associations:
+            return {"notes": [], "message": "No notes associated with this contact"}
+        
+        # Get note details for each associated note
+        notes = []
+        for assoc in associations:
+            note_id = assoc.get("toObjectId")
+            if note_id:
+                note_url = f"{HUBSPOT_API_BASE}/crm/v3/objects/notes/{note_id}"
+                params = {"properties": "hs_note_body,hs_timestamp,hubspot_owner_id"}
+                note_response = requests.get(note_url, headers=get_headers(), params=params)
+                if note_response.status_code == 200:
+                    note_data = note_response.json()
+                    notes.append({
+                        "id": note_id,
+                        "properties": note_data.get("properties", {})
+                    })
+        
+        # Sort by timestamp descending
+        notes.sort(key=lambda x: x.get("properties", {}).get("hs_timestamp", ""), reverse=True)
+        
+        return {"notes": notes, "count": len(notes)}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def update_hubspot(
+    object_type: str,
+    object_id: str,
+    properties: dict
+) -> dict:
+    """
+    Update a HubSpot record (contact, company, or deal).
+    
+    Args:
+        object_type: Type of object - 'contacts', 'companies', or 'deals'
+        object_id: The HubSpot object ID to update
+        properties: Dictionary of properties to update (e.g., {'dealstage': '241882256'})
+    
+    Example - Move deal to Closed Won:
+        update_hubspot('deals', '12345', {'dealstage': '241882256'})
+    """
+    try:
+        url = f"{HUBSPOT_API_BASE}/crm/v3/objects/{object_type}/{object_id}"
+        payload = {"properties": properties}
+        response = requests.patch(url, headers=get_headers(), json=payload)
+        
+        if response.status_code == 200:
+            return {
+                "success": True,
+                "message": f"Successfully updated {object_type} {object_id}",
+                "updated_properties": properties,
+                "result": response.json()
+            }
         else:
-            return {"error": f"Invalid action: {action}. Use: update, create, or get", "status": "error"}
-        
-        response.raise_for_status()
-        
+            return {
+                "success": False,
+                "error": response.text,
+                "status_code": response.status_code
+            }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# =============================================================================
+# Health Check & Server Startup
+# =============================================================================
+
+@mcp.tool()
+def health_check() -> dict:
+    """Check if the HubSpot connection is working."""
+    try:
+        url = f"{HUBSPOT_API_BASE}/crm/v3/objects/contacts"
+        params = {"limit": 1}
+        response = requests.get(url, headers=get_headers(), params=params)
         return {
-            "status": "success",
-            "action": action,
-            "object_type": object_type,
-            "data": response.json()
+            "status": "connected" if response.status_code == 200 else "error",
+            "hubspot_api": response.status_code == 200,
+            "timestamp": datetime.now().isoformat()
         }
-        
-    except requests.exceptions.RequestException as e:
-        return {
-            "error": f"Action {action} failed",
-            "message": str(e),
-            "status": "error"
-        }
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
-    host = "0.0.0.0"
-    
-    print(f"Starting HubSpot FastMCP server on {host}:{port}")
-    
-    # Run with SSE transport for MCP integration compatibility
-    mcp.run(
-        transport="sse",
-        host=host,
-        port=port
-    )
+    mcp.run(transport="sse")
